@@ -1,3 +1,4 @@
-Pillow
-imagehash 
+discord.py
 requests
+imagehash
+Pillow
