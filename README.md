@@ -1,6 +1,8 @@
 # TUTORIAL
 
 ---
+Testing server: https://discord.gg/dVEdmmjCg2
+---
 
 How the bot Was Set Up
 
