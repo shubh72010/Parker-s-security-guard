@@ -2,3 +2,4 @@ discord.py
 requests
 imagehash
 Pillow
+aiohttp
