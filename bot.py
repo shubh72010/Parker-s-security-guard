@@ -1,9 +1,10 @@
+# follian scam scan engine v6.2
 import discord
 import os
 import io
 import aiohttp 
 import imagehash
-from PIL import Image
+from PIL import Image, ImageOps, ImageSequence
 from discord.ext import commands
 import re
 import threading
@@ -12,193 +13,157 @@ import asyncio
 
 # --- CONFIGURATION ---
 SPAM_IMAGE_FOLDER = 'chex/'
-SIMILARITY_THRESHOLD = 10
+THRESHOLD = 10 
+MATCH_VOTES_REQUIRED = 2 
+GRID_MATCH_MIN = 4      
+GIF_FRAME_LIMIT = 8    # Increased for better coverage of longer GIFs
 IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.webp', '.gif')
 
-# --- PORT HANDLING ---
+# --- WEB SERVER (HEALTH CHECKS) ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
-
+    def do_HEAD(self): self.send_response(200); self.end_headers()
     def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/html")
-        self.end_headers()
-        self.wfile.write(b"Bot is alive!")
-
-    def log_message(self, format, *args):
-        return
+        self.send_response(200); self.end_headers()
+        self.wfile.write(b"Bot Active: Hardcore Mode")
+    def log_message(self, format, *args): return
 
 def run_web_server():
     port = int(os.environ.get("PORT", 8080))
-    server_address = ('', port)
-    httpd = HTTPServer(server_address, HealthCheckHandler)
-    print(f"--- Web server listening on port {port} ---")
-    httpd.serve_forever()
+    HTTPServer(('', port), HealthCheckHandler).serve_forever()
 
-# --- BOT SETUP ---
+# --- THE MODERATION ENGINE ---
 intents = discord.Intents.default()
 intents.message_content = True
 intents.messages = True
 intents.guilds = True
+client = commands.Bot(command_prefix="!", intents=intents)
 
-client = discord.Client(intents=intents)
-known_spam_hashes = []
+spam_database = []
+
+def get_grid_hashes(img):
+    hashes = []
+    img = img.convert('RGB')
+    w, h = img.size
+    gw, gh = w // 3, h // 3
+    for i in range(3):
+        for j in range(3):
+            box = (j * gw, i * gh, (j + 1) * gw, (i + 1) * gh)
+            hashes.append(imagehash.phash(img.crop(box)))
+    return hashes
 
 def load_spam_hashes():
-    if not os.path.exists(SPAM_IMAGE_FOLDER):
-        os.makedirs(SPAM_IMAGE_FOLDER)
-        return
-
-    print(f"--- Loading spam images from '{SPAM_IMAGE_FOLDER}' ---")
-    count = 0
+    global spam_database
+    new_db = []
+    if not os.path.exists(SPAM_IMAGE_FOLDER): os.makedirs(SPAM_IMAGE_FOLDER)
     for filename in os.listdir(SPAM_IMAGE_FOLDER):
-        filepath = os.path.join(SPAM_IMAGE_FOLDER, filename)
         try:
-            with Image.open(filepath) as img:
-                h = imagehash.phash(img)
-                known_spam_hashes.append(h)
-                count += 1
-        except:
-            continue
-    print(f"--- Load Complete. {count} spam hashes stored. ---")
+            with Image.open(os.path.join(SPAM_IMAGE_FOLDER, filename)) as img:
+                img = img.convert('RGB')
+                new_db.append({
+                    'name': filename,
+                    'phash': imagehash.phash(img),
+                    'dhash': imagehash.dhash(img),
+                    'ahash': imagehash.average_hash(img),
+                    'grid': get_grid_hashes(img)
+                })
+        except: continue
+    spam_database = new_db
+    print(f"--- Loaded {len(spam_database)} signatures ---")
 
-async def get_image_from_url(url):
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=5) as response:
-                if response.status == 200:
-                    data = await response.read()
-                    return Image.open(io.BytesIO(data))
-    except:
-        pass
+def check_similarity(target_img):
+    frames = []
+    if getattr(target_img, "is_animated", False):
+        total = getattr(target_img, "n_frames", 1)
+        indices = [int(i * (total - 1) / (GIF_FRAME_LIMIT - 1)) for i in range(GIF_FRAME_LIMIT)] if total > 1 else [0]
+        for i in set(indices):
+            target_img.seek(i)
+            frames.append(target_img.convert('RGB'))
+    else:
+        frames.append(target_img.convert('RGB'))
+
+    for frame in frames:
+        # Check original and 3 rotations
+        for angle in [0, 90, 180, 270]:
+            variant = frame.rotate(angle, expand=True) if angle != 0 else frame
+            t_ph = imagehash.phash(variant)
+            t_dh = imagehash.dhash(variant)
+            t_ah = imagehash.average_hash(variant)
+            t_grid = get_grid_hashes(variant)
+
+            for spam in spam_database:
+                # 1. Triple-Voter Logic
+                votes = sum([
+                    (t_ph - spam['phash']) <= THRESHOLD,
+                    (t_dh - spam['dhash']) <= THRESHOLD,
+                    (t_ah - spam['ahash']) <= THRESHOLD
+                ])
+                if votes >= MATCH_VOTES_REQUIRED:
+                    return f"Voter Match ({votes}/3) at {angle}°"
+
+                # 2. Grid/Crop Logic
+                grid_matches = sum(1 for i in range(9) if (t_grid[i] - spam['grid'][i]) <= THRESHOLD)
+                if grid_matches >= GRID_MATCH_MIN:
+                    return f"Grid Match ({grid_matches}/9) at {angle}°"
     return None
 
-def is_spam(image_obj):
-    try:
-        if image_obj.mode != 'RGB':
-            image_obj = image_obj.convert('RGB')
-        target_hash = imagehash.phash(image_obj)
-        for spam_hash in known_spam_hashes:
-            if (target_hash - spam_hash) <= SIMILARITY_THRESHOLD:
-                return True
-    except Exception as e:
-        print(f"Hashing error: {e}")
-    return False
+def extract_urls(msg):
+    urls = [a.url for a in msg.attachments if a.content_type and 'image' in a.content_type]
+    for e in msg.embeds:
+        if e.image: urls.append(e.image.url)
+        elif e.thumbnail: urls.append(e.thumbnail.url)
+    links = re.findall(r'(https?://\S+)', msg.content or "")
+    urls.extend([l for l in links if l.split('?')[0].lower().endswith(IMAGE_EXTENSIONS)])
+    return list(set(urls))
 
-def extract_urls_from_object(message_obj):
-    """
-    Helper function to extract image URLs from any message-like object.
-    Works for: Message, MessageSnapshot, and Referenced Message.
-    """
-    urls = []
+async def scan(message):
+    urls = extract_urls(message)
     
-    # 1. Attachments
-    if hasattr(message_obj, 'attachments') and message_obj.attachments:
-        for a in message_obj.attachments:
-            if a.content_type and a.content_type.startswith('image'):
-                urls.append(a.url)
-
-    # 2. Embeds
-    if hasattr(message_obj, 'embeds') and message_obj.embeds:
-        for e in message_obj.embeds:
-            if e.image: urls.append(e.image.url)
-            elif e.thumbnail: urls.append(e.thumbnail.url)
-
-    # 3. Content Links (Regex)
-    # Note: message_obj.content might be empty or None in some snapshots
-    content = getattr(message_obj, 'content', '')
-    if content:
-        raw_urls = re.findall(r'(https?://\S+)', content)
-        for url in raw_urls:
-            clean_url = url.split('?')[0].lower()
-            if clean_url.endswith(IMAGE_EXTENSIONS):
-                urls.append(url)
-                
-    return urls
-
-async def scan_message(message):
-    image_urls = []
-
-    # A. Check CURRENT message
-    image_urls.extend(extract_urls_from_object(message))
-
-    # B. Check SNAPSHOTS (The new "Forward" feature)
-    # Snapshots are included in the message payload, so they are fast.
-    if hasattr(message, 'snapshots') and message.snapshots:
-        for snapshot in message.snapshots:
-            image_urls.extend(extract_urls_from_object(snapshot))
-
-    # C. Check REFERENCE (Replies / Old Forwards)
-    # We must resolve and fetch the original message object.
+    # Handle snapshots (Forwards)
+    if hasattr(message, 'snapshots'):
+        for s in message.snapshots: urls.extend(extract_urls(s))
+    
+    # Handle references (Replies)
     if message.reference and message.reference.message_id:
         try:
-            # Try to get from cache first (Instant)
-            ref_msg = message.reference.cached_message
-            
-            if not ref_msg:
-                # If not in cache, fetch from API (Slower, but necessary)
-                # We need the channel object to fetch the message
-                ref_channel = client.get_channel(message.reference.channel_id)
-                if ref_channel:
-                    ref_msg = await ref_channel.fetch_message(message.reference.message_id)
+            ref = message.reference.cached_message or await message.channel.fetch_message(message.reference.message_id)
+            urls.extend(extract_urls(ref))
+        except: pass
 
-            if ref_msg:
-                image_urls.extend(extract_urls_from_object(ref_msg))
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            # If original message was deleted or we can't see it, ignore.
-            pass
-
-    # --- PROCESSING ---
-    if not image_urls:
-        return
-
-    # Use a set to avoid checking the same URL twice (e.g. link + embed)
-    unique_urls = set(image_urls)
-    message_flagged = False
-
-    for url in unique_urls:
-        if message_flagged: break
-        
-        img = await get_image_from_url(url)
-        if img:
-            is_match = await asyncio.to_thread(is_spam, img)
-            if is_match:
-                message_flagged = True
-
-    if message_flagged:
-        try:
-            await message.delete()
-            print(f"ACTION: Deleted spam (Forward/Reply included) from {message.author}")
-        except:
-            print(f"ERROR: Cannot delete message in {message.channel}")
+    for url in set(urls):
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=10) as resp:
+                if resp.status == 200:
+                    img = Image.open(io.BytesIO(await resp.read()))
+                    reason = await asyncio.to_thread(check_similarity, img)
+                    if reason:
+                        try:
+                            await message.delete()
+                            print(f"[KILL] User: {message.author} | Logic: {reason} | File: {url.split('/')[-1]}")
+                            return
+                        except: pass
 
 @client.event
 async def on_ready():
-    print(f'Logged in as {client.user}')
     load_spam_hashes()
+    print(f"BOT READY: Listening on {len(client.guilds)} servers.")
 
 @client.event
-async def on_message(message):
-    if message.author == client.user:
-        return
-    await scan_message(message)
+async def on_message(m):
+    if m.author == client.user: return
+    await client.process_commands(m)
+    await scan(m)
 
 @client.event
-async def on_message_edit(before, after):
-    if after.author == client.user:
-        return
-    await scan_message(after)
+async def on_message_edit(b, a):
+    if a.author != client.user: await scan(a)
 
-# --- RUN ---
+@client.command()
+@commands.has_permissions(administrator=True)
+async def reload(ctx):
+    load_spam_hashes()
+    await ctx.send(f"✅ DB Hot-Reloaded: {len(spam_database)} signatures.")
+
 if __name__ == '__main__':
-    web_thread = threading.Thread(target=run_web_server, daemon=True)
-    web_thread.start()
-
-    token = os.getenv('DISCORD_BOT_TOKEN')
-    if token:
-        client.run(token)
-    else:
-        print("Error: No DISCORD_BOT_TOKEN found.")
-        
+    threading.Thread(target=run_web_server, daemon=True).start()
+    client.run(os.getenv('DISCORD_BOT_TOKEN'))
+            
