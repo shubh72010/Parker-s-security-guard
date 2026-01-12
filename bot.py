@@ -15,13 +15,8 @@ SPAM_IMAGE_FOLDER = 'chex/'
 SIMILARITY_THRESHOLD = 10
 IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.webp', '.gif')
 
-# --- PORT HANDLING (FOR RENDER/HOSTING) ---
-
+# --- PORT HANDLING ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    """
-    Handles health checks. 
-    Crucial: Includes do_HEAD to prevent 501 errors from UptimeRobot.
-    """
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
@@ -33,7 +28,6 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Bot is alive!")
 
     def log_message(self, format, *args):
-        # Silence console logs for health checks to keep logs clean
         return
 
 def run_web_server():
@@ -44,7 +38,6 @@ def run_web_server():
     httpd.serve_forever()
 
 # --- BOT SETUP ---
-
 intents = discord.Intents.default()
 intents.message_content = True
 intents.messages = True
@@ -72,27 +65,20 @@ def load_spam_hashes():
     print(f"--- Load Complete. {count} spam hashes stored. ---")
 
 async def get_image_from_url(url):
-    """
-    Asynchronously downloads an image. 
-    Using aiohttp prevents the bot from 'freezing' while downloading.
-    """
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=5) as response:
                 if response.status == 200:
                     data = await response.read()
                     return Image.open(io.BytesIO(data))
-    except Exception as e:
-        # Expected errors: 404s, timeouts, non-image links
+    except:
         pass
     return None
 
 def is_spam(image_obj):
     try:
-        # Convert to RGB to avoid errors with transparent PNGs/GIFs during hashing
         if image_obj.mode != 'RGB':
             image_obj = image_obj.convert('RGB')
-            
         target_hash = imagehash.phash(image_obj)
         for spam_hash in known_spam_hashes:
             if (target_hash - spam_hash) <= SIMILARITY_THRESHOLD:
@@ -101,54 +87,92 @@ def is_spam(image_obj):
         print(f"Hashing error: {e}")
     return False
 
-async def scan_message(message):
+def extract_urls_from_object(message_obj):
     """
-    Scans a message for spam images. Logic separated so we can 
-    call it on both 'on_message' and 'on_message_edit'.
+    Helper function to extract image URLs from any message-like object.
+    Works for: Message, MessageSnapshot, and Referenced Message.
     """
-    # 1. Collect URLs
-    image_urls = []
+    urls = []
     
-    if message.attachments:
-        for a in message.attachments:
+    # 1. Attachments
+    if hasattr(message_obj, 'attachments') and message_obj.attachments:
+        for a in message_obj.attachments:
             if a.content_type and a.content_type.startswith('image'):
-                image_urls.append(a.url)
+                urls.append(a.url)
 
-    if message.embeds:
-        for e in message.embeds:
-            if e.image: image_urls.append(e.image.url)
-            elif e.thumbnail: image_urls.append(e.thumbnail.url)
+    # 2. Embeds
+    if hasattr(message_obj, 'embeds') and message_obj.embeds:
+        for e in message_obj.embeds:
+            if e.image: urls.append(e.image.url)
+            elif e.thumbnail: urls.append(e.thumbnail.url)
 
-    raw_urls = re.findall(r'(https?://\S+)', message.content)
-    for url in raw_urls:
-        clean_url = url.split('?')[0].lower()
-        if clean_url.endswith(IMAGE_EXTENSIONS):
-            image_urls.append(url)
+    # 3. Content Links (Regex)
+    # Note: message_obj.content might be empty or None in some snapshots
+    content = getattr(message_obj, 'content', '')
+    if content:
+        raw_urls = re.findall(r'(https?://\S+)', content)
+        for url in raw_urls:
+            clean_url = url.split('?')[0].lower()
+            if clean_url.endswith(IMAGE_EXTENSIONS):
+                urls.append(url)
+                
+    return urls
 
-    # 2. Check URLs
+async def scan_message(message):
+    image_urls = []
+
+    # A. Check CURRENT message
+    image_urls.extend(extract_urls_from_object(message))
+
+    # B. Check SNAPSHOTS (The new "Forward" feature)
+    # Snapshots are included in the message payload, so they are fast.
+    if hasattr(message, 'snapshots') and message.snapshots:
+        for snapshot in message.snapshots:
+            image_urls.extend(extract_urls_from_object(snapshot))
+
+    # C. Check REFERENCE (Replies / Old Forwards)
+    # We must resolve and fetch the original message object.
+    if message.reference and message.reference.message_id:
+        try:
+            # Try to get from cache first (Instant)
+            ref_msg = message.reference.cached_message
+            
+            if not ref_msg:
+                # If not in cache, fetch from API (Slower, but necessary)
+                # We need the channel object to fetch the message
+                ref_channel = client.get_channel(message.reference.channel_id)
+                if ref_channel:
+                    ref_msg = await ref_channel.fetch_message(message.reference.message_id)
+
+            if ref_msg:
+                image_urls.extend(extract_urls_from_object(ref_msg))
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            # If original message was deleted or we can't see it, ignore.
+            pass
+
+    # --- PROCESSING ---
     if not image_urls:
         return
 
+    # Use a set to avoid checking the same URL twice (e.g. link + embed)
+    unique_urls = set(image_urls)
     message_flagged = False
-    for url in image_urls:
-        if message_flagged: break
 
+    for url in unique_urls:
+        if message_flagged: break
+        
         img = await get_image_from_url(url)
         if img:
-            # Hash calculation is CPU bound, running it in executor keeps bot responsive
             is_match = await asyncio.to_thread(is_spam, img)
             if is_match:
                 message_flagged = True
 
-    # 3. Delete if flagged
     if message_flagged:
         try:
             await message.delete()
-            print(f"ACTION: Deleted spam from {message.author}")
-        except discord.NotFound:
-            pass # Already deleted
-        except discord.Forbidden:
-            print(f"ERROR: Cannot delete message in {message.channel.name}")
+            print(f"ACTION: Deleted spam (Forward/Reply included) from {message.author}")
+        except:
+            print(f"ERROR: Cannot delete message in {message.channel}")
 
 @client.event
 async def on_ready():
@@ -163,17 +187,12 @@ async def on_message(message):
 
 @client.event
 async def on_message_edit(before, after):
-    """
-    Catches images that appear late (like link previews/embeds) 
-    that weren't there when the message was first sent.
-    """
     if after.author == client.user:
         return
     await scan_message(after)
 
 # --- RUN ---
 if __name__ == '__main__':
-    # Start web server thread
     web_thread = threading.Thread(target=run_web_server, daemon=True)
     web_thread.start()
 
