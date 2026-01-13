@@ -1,6 +1,8 @@
 # TUTORIAL
 
 ---
+command: !DBUpdate (send it with an attachment so it can store it in it's database)
+---
 Testing server: https://discord.gg/dVEdmmjCg2
 ---
 
