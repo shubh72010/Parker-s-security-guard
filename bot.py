@@ -1,9 +1,10 @@
-# follian scam scan engine v6.3
+# scam image scan engine v7
 import discord
 import os
 import io
 import aiohttp 
 import imagehash
+import base64
 from PIL import Image, ImageOps, ImageSequence
 from discord.ext import commands
 import re
@@ -19,17 +20,28 @@ GRID_MATCH_MIN = 4
 GIF_FRAME_LIMIT = 8    
 IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.webp', '.gif')
 
+# --- GITHUB CONFIGURATION ---
+# Ensure these are set in your environment variables
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") 
+GITHUB_REPO = os.getenv("GITHUB_REPO")   # Format: "Username/RepoName"
+GITHUB_BRANCH = "main"                   # or "master"
+
 # --- WEB SERVER (HEALTH CHECKS) ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_HEAD(self): self.send_response(200); self.end_headers()
+    def do_HEAD(self): 
+        self.send_response(200)
+        self.end_headers()
     def do_GET(self):
-        self.send_response(200); self.end_headers()
-        self.wfile.write(b"Bot Active: Hardcore Pro Mode")
-    def log_message(self, format, *args): return
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot Active: Hardcore Pro Mode - GitHub Sync Enabled")
+    def log_message(self, format, *args): 
+        return
 
 def run_web_server():
     port = int(os.environ.get("PORT", 8080))
-    HTTPServer(('', port), HealthCheckHandler).serve_forever()
+    server = HTTPServer(('', port), HealthCheckHandler)
+    server.serve_forever()
 
 # --- THE MODERATION ENGINE ---
 intents = discord.Intents.default()
@@ -65,14 +77,14 @@ def generate_entry(img, filename):
 def load_spam_hashes():
     global spam_database
     new_db = []
-    if not os.path.exists(SPAM_IMAGE_FOLDER): os.makedirs(SPAM_IMAGE_FOLDER)
+    if not os.path.exists(SPAM_IMAGE_FOLDER): 
+        os.makedirs(SPAM_IMAGE_FOLDER)
     for filename in os.listdir(SPAM_IMAGE_FOLDER):
         try:
             with Image.open(os.path.join(SPAM_IMAGE_FOLDER, filename)) as img:
-                # We only need to store the base version from disk; 
-                # check_similarity handles incoming rotations.
                 new_db.append(generate_entry(img, filename))
-        except: continue
+        except: 
+            continue
     spam_database = new_db
     print(f"--- Loaded {len(spam_database)} signatures ---")
 
@@ -102,42 +114,89 @@ def check_similarity(target_img):
                     (t_dh - spam['dhash']) <= THRESHOLD,
                     (t_ah - spam['ahash']) <= THRESHOLD
                 ])
-                if votes >= MATCH_VOTES_REQUIRED: return f"Voter Match ({votes}/3) @ {angle}°"
-                
+                if votes >= MATCH_VOTES_REQUIRED: 
+                    return f"Voter Match ({votes}/3) @ {angle}°"
+
                 grid_matches = sum(1 for i in range(9) if (t_grid[i] - spam['grid'][i]) <= THRESHOLD)
-                if grid_matches >= GRID_MATCH_MIN: return f"Grid Match ({grid_matches}/9) @ {angle}°"
+                if grid_matches >= GRID_MATCH_MIN: 
+                    return f"Grid Match ({grid_matches}/9) @ {angle}°"
     return None
+
+async def upload_to_github(filename, file_bytes):
+    """Uploads file bytes directly to the GitHub repository."""
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        print("❌ Error: GITHUB_TOKEN or GITHUB_REPO not set in environment.")
+        return False
+
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{SPAM_IMAGE_FOLDER}{filename}"
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    
+    content_b64 = base64.b64encode(file_bytes).decode('utf-8')
+    data = {
+        "message": f"Auto-upload scam signature: {filename}",
+        "content": content_b64,
+        "branch": GITHUB_BRANCH
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.put(url, headers=headers, json=data) as resp:
+            if resp.status in [200, 201]:
+                return True
+            else:
+                error_log = await resp.text()
+                print(f"❌ GitHub API Error: {resp.status} - {error_log}")
+                return False
 
 # --- COMMANDS ---
 
 @client.command(name="DBUpdate")
 @commands.has_permissions(administrator=True)
 async def db_update(ctx):
-    if not ctx.message.attachments: return await ctx.send("❌ No attachments found.")
+    if not ctx.message.attachments: 
+        return await ctx.send("❌ No attachments found.")
 
     added, dups, fails = 0, 0, 0
-    status = await ctx.send("⏳ Hashing batch...")
+    status = await ctx.send("⏳ Processing & Syncing with GitHub...")
 
     for attachment in ctx.message.attachments:
         if not attachment.filename.lower().endswith(IMAGE_EXTENSIONS):
-            fails += 1; continue
+            fails += 1
+            continue
         try:
             img_bytes = await attachment.read()
             img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-            
-            # Check if this exact image OR its rotations exist
+
+            # Duplicate Check
             is_dup = await asyncio.to_thread(check_similarity, img)
             if is_dup:
-                dups += 1; continue
+                dups += 1
+                continue
 
-            # Save and store in memory
+            # Naming
             fname = f"{attachment.id}_{attachment.filename}"
-            await attachment.save(os.path.join(SPAM_IMAGE_FOLDER, fname))
-            spam_database.append(generate_entry(img, fname))
-            added += 1
-        except: fails += 1
+            
+            # Push to GitHub
+            success = await upload_to_github(fname, img_bytes)
+            
+            if success:
+                # Save locally for immediate cache
+                local_path = os.path.join(SPAM_IMAGE_FOLDER, fname)
+                with open(local_path, "wb") as f:
+                    f.write(img_bytes)
+                
+                # Update memory
+                spam_database.append(generate_entry(img, fname))
+                added += 1
+            else:
+                fails += 1
+        except Exception as e:
+            print(f"Process Error: {e}")
+            fails += 1
 
-    await status.edit(content=f"**Batch Complete**\n✅ Added: {added}\n⚠️ Dups: {dups}\n❌ Failed: {fails}")
+    await status.edit(content=f"**GitHub Sync Results**\n✅ Uploaded: {added}\n⚠️ Duplicates: {dups}\n❌ Failed: {fails}")
 
 # --- MESSAGE SCANNING ---
 
@@ -146,12 +205,10 @@ async def scan(message):
     for e in message.embeds:
         if e.image: urls.append(e.image.url)
         elif e.thumbnail: urls.append(e.thumbnail.url)
+    
     links = re.findall(r'(https?://\S+)', message.content or "")
     urls.extend([l for l in links if l.split('?')[0].lower().endswith(IMAGE_EXTENSIONS)])
 
-    # Forward/Reply Crawl
-    if hasattr(message, 'snapshots'):
-        for s in message.snapshots: urls.extend([a.url for a in s.attachments])
     if message.reference and message.reference.message_id:
         try:
             ref = message.reference.cached_message or await message.channel.fetch_message(message.reference.message_id)
@@ -163,26 +220,29 @@ async def scan(message):
             try:
                 async with session.get(url, timeout=10) as resp:
                     if resp.status == 200:
-                        img = Image.open(io.BytesIO(await resp.read()))
+                        img_data = await resp.read()
+                        img = Image.open(io.BytesIO(img_data))
                         reason = await asyncio.to_thread(check_similarity, img)
                         if reason:
                             await message.delete()
                             print(f"[KILL] {message.author} | {reason}")
                             return
-            except: continue
+            except: 
+                continue
 
 @client.event
 async def on_ready():
     load_spam_hashes()
-    print(f"BOT READY: {client.user}")
+    print(f"BOT ONLINE: {client.user}")
 
 @client.event
 async def on_message(m):
-    if m.author == client.user: return
+    if m.author == client.user: 
+        return
     await client.process_commands(m)
     await scan(m)
 
 if __name__ == '__main__':
     threading.Thread(target=run_web_server, daemon=True).start()
     client.run(os.getenv('DISCORD_BOT_TOKEN'))
-        
+    
