@@ -3,3 +3,5 @@ requests
 imagehash
 Pillow
 aiohttp
+numpy
+scipy
